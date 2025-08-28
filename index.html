@@ -1,0 +1,525 @@
+<!doctype html>
+<html lang="sw">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Kavishe Voice Lab v2</title>
+<style>
+  :root{--accent:#0ea5a6;--muted:#64748b;background:#f8fafc}
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:12px;background:var(--muted, #f1f5f9);color:#0f172a}
+  .card{max-width:980px;margin:12px auto;background:#fff;border-radius:12px;padding:16px;box-shadow:0 8px 30px rgba(2,6,23,0.08)}
+  h1{margin:0 0 6px;font-size:20px}
+  label{display:block;margin-top:10px;font-weight:700}
+  .controls{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:10px}
+  input[type="range"]{width:100%}
+  select,input[type=file],button{padding:10px;border-radius:8px;border:1px solid #e6eef2}
+  button{background:var(--accent);color:white;border:0;font-weight:700;cursor:pointer}
+  button.secondary{background:#475569}
+  .row{display:flex;gap:8px;align-items:center;margin-top:8px}
+  audio{width:100%;margin-top:8px}
+  .small{font-size:13px;color:#475569}
+  .preset-grid{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+  .preset-grid button{background:#eef2f2;color:#0f172a;padding:8px;border-radius:8px;border:1px solid #cfe3e2}
+  .status{margin-top:8px;font-weight:700}
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Kavishe Voice Lab — v2 (Live + HD render)</h1>
+    <div class="small">Pakia au rekodi, bofya <strong>Play Live</strong> kuona mabadiliko mara moja. Kama unataka faili bora, bonyeza <strong>Render & Download WAV</strong>.</div>
+
+    <label>Pakia file ya audio (mp3/wav/m4a) au tumia kurekodi</label>
+    <input id="fileInput" type="file" accept="audio/*">
+
+    <div class="row">
+      <button id="recordBtn">Anza kurekodi</button>
+      <button id="stopRecBtn" class="secondary" disabled>Simamisha Rekodi</button>
+      <div id="recStatus" class="small">Hujarekodi bado</div>
+    </div>
+
+    <label>Presets (bonyeza)</label>
+    <div class="preset-grid">
+      <button data-preset="child_f">Mtoto (kike)</button>
+      <button data-preset="child_m">Mtoto (kiume)</button>
+      <button data-preset="female">Mwanamke</button>
+      <button data-preset="male">Mwanaume</button>
+      <button data-preset="drunk">Kilevi (slurred)</button>
+      <button data-preset="announcer">Teja / Announcer</button>
+      <button data-preset="robot">Robot</button>
+      <button data-preset="none">Asili</button>
+    </div>
+
+    <div class="controls">
+      <div>
+        <label>Pitch (semitones) <span id="pitchVal">0</span></label>
+        <input id="pitch" type="range" min="-12" max="12" step="1" value="0">
+        <div class="small">Negative = sauti nzito, Positive = sauti kali (mtoto).</div>
+      </div>
+      <div>
+        <label>Speed / Tempo <span id="speedVal">1.00</span>x</label>
+        <input id="speed" type="range" min="0.5" max="1.6" step="0.01" value="1">
+        <div class="small">0.5 = polepole, 1 = kawaida, &gt;1 = haraka</div>
+      </div>
+    </div>
+
+    <label>Formant / Tone adjust <span id="formVal">1.00</span></label>
+    <input id="formant" type="range" min="0.7" max="1.5" step="0.01" value="1">
+    <div class="small">Badili ili kuiga utegemezi wa formants (mtoto/mwanamke/mwanaume)</div>
+
+    <div class="row" style="margin-top:12px">
+      <button id="playLiveBtn">Play Live</button>
+      <button id="stopLiveBtn" class="secondary" disabled>Stop Live</button>
+      <button id="renderBtn" class="secondary">Render & Download WAV</button>
+    </div>
+
+    <div class="preview" style="margin-top:12px">
+      <label>Player preview (rendered WAV after download)</label>
+      <audio id="player" controls></audio>
+    </div>
+
+    <div id="status" class="status"></div>
+    <div class="small" style="margin-top:8px">
+      Vidokezo: 
+      <ul>
+        <li>Tumia <strong>Play Live</strong> kurekebisha sliders wakati sauti inaendelea ili kuona mabadiliko mara moja.</li>
+        <li>Kwa ubora wa studio unahitaji server-side ML voice conversion; hii solution ni client-only kwa matumizi ya haraka na majaribio.</li>
+      </ul>
+    </div>
+  </div>
+
+<script>
+/* Kavishe Voice Lab v2
+ - Better recording handling
+ - Live granular playback scheduler (adjustable pitch/formant/speed in real-time)
+ - Render to WAV for download (HD)
+ - Presets: child_m, child_f, female, male, drunk, announcer, robot
+*/
+
+// Globals
+let audioCtx = null;
+let sourceBuffer = null;        // decoded original audio
+let mediaRecorder = null;
+let recordedChunks = [];
+let liveScheduler = null;
+let liveState = { playing:false, position:0 }; // position in samples for live playback
+let schedulerHandle = null;
+let grainParams = { grainMs:80, overlap:0.65 }; // tuneable: bigger grainMs = smoother but more latency
+let lfo = { enabled:false, rate:5, depth:0.002 }; // for drunk/wobble
+let lastPreset = 'none';
+const statusEl = document.getElementById('status');
+
+// UI
+const fileInput = document.getElementById('fileInput');
+const recordBtn = document.getElementById('recordBtn');
+const stopRecBtn = document.getElementById('stopRecBtn');
+const recStatus = document.getElementById('recStatus');
+const pitchEl = document.getElementById('pitch');
+const pitchVal = document.getElementById('pitchVal');
+const speedEl = document.getElementById('speed');
+const speedVal = document.getElementById('speedVal');
+const formantEl = document.getElementById('formant');
+const formVal = document.getElementById('formVal');
+const playLiveBtn = document.getElementById('playLiveBtn');
+const stopLiveBtn = document.getElementById('stopLiveBtn');
+const renderBtn = document.getElementById('renderBtn');
+const player = document.getElementById('player');
+const presetButtons = document.querySelectorAll('.preset-grid button');
+
+pitchEl.addEventListener('input', ()=> pitchVal.textContent = pitchEl.value);
+speedEl.addEventListener('input', ()=> speedVal.textContent = Number(speedEl.value).toFixed(2));
+formantEl.addEventListener('input', ()=> formVal.textContent = Number(formantEl.value).toFixed(2));
+
+// Apply presets
+presetButtons.forEach(btn=>{
+  btn.addEventListener('click', ()=> {
+    applyPreset(btn.getAttribute('data-preset'));
+  });
+});
+
+function applyPreset(p){
+  lastPreset = p;
+  if(p === 'none'){ pitchEl.value=0; formantEl.value=1; speedEl.value=1; lfo.enabled=false; }
+  else if(p === 'child_f'){ pitchEl.value=7; formantEl.value=1.18; speedEl.value=1.05; lfo.enabled=false; }
+  else if(p === 'child_m'){ pitchEl.value=5; formantEl.value=1.12; speedEl.value=1.04; lfo.enabled=false; }
+  else if(p === 'female'){ pitchEl.value=3; formantEl.value=1.06; speedEl.value=1.0; lfo.enabled=false; }
+  else if(p === 'male'){ pitchEl.value=-3; formantEl.value=0.95; speedEl.value=0.98; lfo.enabled=false; }
+  else if(p === 'drunk'){ pitchEl.value=-1; formantEl.value=0.95; speedEl.value=0.92; lfo.enabled=true; lfo.rate=3; lfo.depth=0.006; }
+  else if(p === 'announcer'){ pitchEl.value=-2; formantEl.value=0.9; speedEl.value=1.02; lfo.enabled=false; }
+  else if(p === 'robot'){ pitchEl.value=0; formantEl.value=1; speedEl.value=1; lfo.enabled=false; }
+  pitchVal.textContent = pitchEl.value;
+  speedVal.textContent = Number(speedEl.value).toFixed(2);
+  formVal.textContent = Number(formantEl.value).toFixed(2);
+  status('Preset applied: ' + p);
+}
+
+// Recording handling (MediaRecorder)
+recordBtn.addEventListener('click', async ()=>{
+  try{
+    if(!navigator.mediaDevices) { alert('Browser yako haitoi microphone access. Tumia Chrome/modern browser.'); return; }
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    mediaRecorder = new MediaRecorder(stream);
+    recordedChunks = [];
+    mediaRecorder.ondataavailable = e => { if(e.data && e.data.size>0) recordedChunks.push(e.data); };
+    mediaRecorder.onstop = async ()=>{
+      const blob = new Blob(recordedChunks, { type: 'audio/webm' });
+      recStatus.textContent = 'Recording complete. Decoding...';
+      await decodeArrayBuffer(await blob.arrayBuffer());
+      recStatus.textContent = 'Recording loaded';
+      status('Recording loaded, tayari kucheza.');
+    };
+    mediaRecorder.start();
+    recStatus.textContent = 'Recording...';
+    recordBtn.disabled = true;
+    stopRecBtn.disabled = false;
+  }catch(err){
+    alert('Tatizo wa microphone: ' + err.message);
+  }
+});
+stopRecBtn.addEventListener('click', ()=>{
+  if(mediaRecorder && mediaRecorder.state === 'recording') mediaRecorder.stop();
+  recordBtn.disabled = false;
+  stopRecBtn.disabled = true;
+});
+
+// File input
+fileInput.addEventListener('change', async (ev)=>{
+  const f = ev.target.files[0];
+  if(!f) return;
+  status('Loading file: ' + f.name);
+  const arr = await f.arrayBuffer();
+  await decodeArrayBuffer(arr);
+  status('File loaded: ' + f.name);
+});
+
+// Init AudioContext lazily
+async function ensureAudioContext(){
+  if(!audioCtx){
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+}
+
+// Decode arraybuffer -> audio buffer
+async function decodeArrayBuffer(arr){
+  await ensureAudioContext();
+  try{
+    sourceBuffer = await audioCtx.decodeAudioData(arr.slice(0));
+    // normalize to mono for simplicity (mixdown) but keep stereo if present
+    status('Audio decoded: ' + sourceBuffer.numberOfChannels + ' channels, ' + Math.round(sourceBuffer.sampleRate/1000*10)/10 + ' kHz');
+  }catch(e){
+    // try a different decode strategy (Safari weirdness)
+    const blob = new Blob([arr]);
+    const url = URL.createObjectURL(blob);
+    const aud = new Audio();
+    aud.src = url;
+    await aud.play().catch(()=>{}); // try to prime
+    // fallback: create audio element and capture via offline? Hard fallback; inform user
+    alert('Kuna shida ku-decode file. Jaribu kutumia mp3/wav au re-record kwenye browser (Chrome). Error: ' + e.message);
+  }
+}
+
+// Live playback via granular scheduler (smoother than simple playbackRate-based)
+playLiveBtn.addEventListener('click', async ()=>{
+  if(!sourceBuffer){ alert('Hakuna audio. Pakia file au rekodi kwanza.'); return; }
+  await ensureAudioContext();
+  if(liveState.playing){
+    status('Live already playing');
+    return;
+  }
+  liveState.playing = true;
+  liveState.position = 0;
+  startLiveScheduler();
+  playLiveBtn.disabled = true;
+  stopLiveBtn.disabled = false;
+  status('Live playback started — soma sliders wakati inacheza.');
+});
+
+stopLiveBtn.addEventListener('click', ()=>{
+  stopLive();
+});
+
+function stopLive(){
+  if(!liveState.playing) return;
+  liveState.playing = false;
+  if(schedulerHandle) { clearInterval(schedulerHandle); schedulerHandle = null; }
+  // stop any scheduled nodes by closing/recreating audioCtx? we'll use a simple flag to avoid playing new grains
+  playLiveBtn.disabled = false;
+  stopLiveBtn.disabled = true;
+  status('Live stopped.');
+}
+
+// scheduler: continuously create small grains scheduled slightly ahead
+function startLiveScheduler(){
+  const sr = sourceBuffer.sampleRate;
+  const grainSize = Math.max(64, Math.floor(sr * (grainParams.grainMs / 1000))); // samples
+  const hop = Math.floor(grainSize * (1 - grainParams.overlap)); // advance per grain in samples
+  const lookahead = 0.1; // seconds to schedule ahead
+  let nextScheduleTime = audioCtx.currentTime + 0.05; // initial schedule time
+  const channelCount = sourceBuffer.numberOfChannels;
+  // We'll schedule grains every (hop / sr) seconds
+  const scheduleIntervalMs = Math.max(15, Math.floor((hop / sr) * 1000 / 2));
+  // keep a simple pointer in samples
+  schedulerHandle = setInterval(()=>{
+    if(!liveState.playing) return;
+    // schedule a batch of grains to ensure continuous playback
+    while(nextScheduleTime < audioCtx.currentTime + lookahead){
+      // compute current position in samples
+      const pos = liveState.position;
+      // build grain buffer
+      const buf = audioCtx.createBuffer(channelCount, grainSize, sr);
+      for(let ch=0; ch<channelCount; ch++){
+        const inData = sourceBuffer.getChannelData(ch);
+        const out = buf.getChannelData(ch);
+        for(let i=0;i<grainSize;i++){
+          const idx = Math.min(inData.length-1, pos + i);
+          // apply windowing (hann)
+          const w = 0.5 * (1 - Math.cos(2*Math.PI*i/(grainSize-1)));
+          out[i] = inData[idx] * w;
+        }
+        // apply simple formant approximation: apply dynamic EQ by scaling frequency-domain is heavy;
+        // we approximate by pre-emphasizing later samples (cheap)
+        const form = Number(formantEl.value);
+        if(form !== 1.0){
+          // mild dynamic scaling (cheap approx)
+          for(let i=0;i<grainSize;i++){
+            const posNorm = i/grainSize;
+            const factor = 1 + (form - 1) * (posNorm - 0.5) * 0.35;
+            out[i] *= factor;
+          }
+        }
+      }
+      // create source
+      const src = audioCtx.createBufferSource();
+      src.buffer = buf;
+      // playbackRate controls pitch of grain; apply semitone ratio plus LFO if enabled
+      const semitones = Number(pitchEl.value);
+      const pitchRatio = Math.pow(2, semitones/12);
+      let rate = pitchRatio;
+      // incorporate global speed: to preserve tempo separately, we will advance liveState.position by hop * (1/speed)
+      const speed = Number(speedEl.value);
+      // LFO for drunk wobble
+      if(lfo.enabled){
+        const t = audioCtx.currentTime;
+        const wob = Math.sin(2*Math.PI*lfo.rate*t) * lfo.depth * pitchRatio;
+        rate = pitchRatio + wob;
+      }
+      src.playbackRate.value = rate;
+      // connect through a small filter & optional reverb for announcer
+      const gainNode = audioCtx.createGain();
+      gainNode.gain.value = 1.0;
+      // eq: simple BiquadFilter tweaks based on preset
+      const biquad = audioCtx.createBiquadFilter();
+      biquad.type = "peaking";
+      // default neutral; adjust for announcer & drunk
+      if(lastPreset === 'announcer'){
+        biquad.frequency.value = 1200;
+        biquad.gain.value = 3;
+        biquad.Q.value = 1;
+      } else if(lastPreset === 'drunk'){
+        biquad.frequency.value = 400;
+        biquad.gain.value = -1;
+        biquad.Q.value = 0.7;
+      } else {
+        biquad.gain.value = 0;
+      }
+      src.connect(biquad);
+      biquad.connect(gainNode);
+      gainNode.connect(audioCtx.destination);
+      // schedule
+      src.start(nextScheduleTime);
+      // stop after duration to avoid leaks
+      const grainPlayDur = (grainSize / sr) / rate;
+      src.stop(nextScheduleTime + grainPlayDur + 0.02);
+      // advance pointers
+      nextScheduleTime += (hop / sr);
+      // advance sample pointer by hop * (1/speed) to change tempo independent from pitch
+      liveState.position = Math.floor(liveState.position + hop * speed);
+      // if reached end, stop
+      if(liveState.position >= sourceBuffer.length - grainSize){
+        // wrap or stop
+        liveState.playing = false;
+        nextScheduleTime = audioCtx.currentTime + 0.05;
+        status('Reached end of audio.');
+        stopLive();
+        break;
+      }
+    } // end while
+  }, scheduleIntervalMs);
+}
+
+// Render & Download WAV (uses OfflineAudioContext to make a clean WAV)
+renderBtn.addEventListener('click', async ()=>{
+  if(!sourceBuffer){ alert('Hakuna audio. Pakia au rekodi kwanza.'); return; }
+  renderBtn.disabled = true;
+  status('Rendering WAV. Hii inaweza kuchukua sekunde kadhaa…');
+  try{
+    const rendered = await renderProcessedOffline(sourceBuffer);
+    const wav = audioBufferToWav(rendered);
+    const blob = new Blob([wav], { type: 'audio/wav' });
+    const url = URL.createObjectURL(blob);
+    player.src = url;
+    player.load();
+    // trigger download
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'kavishe_voice_hd.wav';
+    a.click();
+    status('Render complete — pakua imerekodiwa.');
+  }catch(err){
+    alert('Error while rendering: ' + err.message);
+    status('Render failed: ' + err.message);
+  } finally {
+    renderBtn.disabled = false;
+  }
+});
+
+// Offline rendering pipeline: re-implement similar processing as live but in OfflineAudioContext for full buffer
+async function renderProcessedOffline(inputBuffer){
+  await ensureAudioContext();
+  const sr = inputBuffer.sampleRate;
+  const channels = inputBuffer.numberOfChannels;
+  // length: keep same duration scaled by speed
+  const speed = Number(speedEl.value);
+  const outLen = Math.max(1, Math.floor(inputBuffer.length / speed));
+  const offline = new OfflineAudioContext(channels, outLen, sr);
+  const src = offline.createBufferSource();
+  // We'll create one buffer processed by granular pitch-shift algorithm: to simplify, we will create an offline buffer that
+  // applies pitchRatio via playbackRate on a bufferSource and uses time-stretch trick by pre-resampling: To keep CPU reasonable we'll:
+  // 1) create an intermediate rendered buffer by playing inputBuffer into offline at playbackRate = pitchRatio (changes pitch)
+  // 2) then resample to desired tempo by rendering again at rate = 1/speed
+  // Step 1
+  const semitones = Number(pitchEl.value);
+  const pitchRatio = Math.pow(2, semitones/12);
+  // Render pitched buffer
+  const len1 = Math.max(1, Math.floor(inputBuffer.length / pitchRatio));
+  const offline1 = new OfflineAudioContext(channels, len1, sr);
+  const s1 = offline1.createBufferSource();
+  s1.buffer = inputBuffer;
+  s1.playbackRate.value = pitchRatio;
+  // basic formant approx via Convolver? heavy. We'll add a peaking EQ
+  const eq = offline1.createBiquadFilter();
+  eq.type = 'peaking';
+  const form = Number(formantEl.value);
+  if(form > 1.02){
+    eq.frequency.value = 3000; eq.gain.value = (form-1)*6; eq.Q.value = 0.8;
+  } else if(form < 0.98){
+    eq.frequency.value = 500; eq.gain.value = -(1-form)*3; eq.Q.value = 0.8;
+  } else { eq.gain.value = 0; }
+  s1.connect(eq);
+  eq.connect(offline1.destination);
+  s1.start(0);
+  const rendered1 = await offline1.startRendering();
+
+  // Step 2: change tempo to desired speed by resampling
+  const targetLen = Math.max(1, Math.floor(rendered1.length / speed));
+  const offline2 = new OfflineAudioContext(channels, targetLen, sr);
+  const s2 = offline2.createBufferSource();
+  s2.buffer = rendered1;
+  s2.playbackRate.value = 1.0; // we'll use offline context length to resample by scheduling play with rate=1 but stop earlier/later
+  s2.connect(offline2.destination);
+  s2.start(0);
+  const rendered2 = await offline2.startRendering();
+
+  // Optional: add announcer reverb for announcer preset
+  if(lastPreset === 'announcer'){
+    // small reverb simulation by convolving with short impulse
+    const convOffline = new OfflineAudioContext(channels, rendered2.length, sr);
+    const srcConv = convOffline.createBufferSource();
+    srcConv.buffer = rendered2;
+    const convolver = convOffline.createConvolver();
+    // create impulse (short)
+    const irLen = Math.floor(sr * 0.3); // 300ms
+    const ir = convOffline.createBuffer(channels, irLen, sr);
+    for(let ch=0; ch<channels; ch++){
+      const d = ir.getChannelData(ch);
+      for(let i=0;i<irLen;i++){
+        d[i] = (Math.random()*2-1) * Math.pow(1 - i/irLen, 2) * 0.25;
+      }
+    }
+    convolver.buffer = ir;
+    srcConv.connect(convolver);
+    convolver.connect(convOffline.destination);
+    srcConv.start(0);
+    const final = await convOffline.startRendering();
+    return final;
+  }
+
+  return rendered2;
+}
+
+/* ---------- WAV helpers (same as before, robust for mono/stereo) ---------- */
+function audioBufferToWav(buffer, opt) {
+  opt = opt || {}
+  var numChannels = buffer.numberOfChannels
+  var sampleRate = buffer.sampleRate
+  var format = opt.float32 ? 3 : 1
+  var bitDepth = format === 3 ? 32 : 16
+
+  var result
+  if (numChannels === 2) {
+    result = interleave(buffer.getChannelData(0), buffer.getChannelData(1))
+  } else {
+    result = buffer.getChannelData(0)
+  }
+
+  return encodeWAV(result, format, sampleRate, numChannels, bitDepth)
+}
+
+function interleave(inputL, inputR){
+  var length = inputL.length + inputR.length
+  var result = new Float32Array(length)
+  var index = 0, inputIndex = 0
+  while (index < length) {
+    result[index++] = inputL[inputIndex]
+    result[index++] = inputR[inputIndex]
+    inputIndex++
+  }
+  return result
+}
+
+function floatTo16BitPCM(output, offset, input){
+  for (var i = 0; i < input.length; i++, offset += 2) {
+    var s = Math.max(-1, Math.min(1, input[i]))
+    output.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true)
+  }
+}
+
+function writeString(view, offset, string){
+  for (var i = 0; i < string.length; i++){
+    view.setUint8(offset + i, string.charCodeAt(i))
+  }
+}
+
+function encodeWAV(samples, format, sampleRate, numChannels, bitDepth){
+  var bytesPerSample = bitDepth / 8
+  var blockAlign = numChannels * bytesPerSample
+  var buffer = new ArrayBuffer(44 + samples.length * bytesPerSample)
+  var view = new DataView(buffer)
+  writeString(view, 0, 'RIFF')
+  view.setUint32(4, 36 + samples.length * bytesPerSample, true)
+  writeString(view, 8, 'WAVE')
+  writeString(view, 12, 'fmt ')
+  view.setUint32(16, 16, true)
+  view.setUint16(20, format, true)
+  view.setUint16(22, numChannels, true)
+  view.setUint32(24, sampleRate, true)
+  view.setUint32(28, sampleRate * blockAlign, true)
+  view.setUint16(32, blockAlign, true)
+  view.setUint16(34, bitDepth, true)
+  writeString(view, 36, 'data')
+  view.setUint32(40, samples.length * bytesPerSample, true)
+  if (format === 1) {
+    floatTo16BitPCM(view, 44, samples)
+  } else {
+    var floatView = new Float32Array(buffer, 44)
+    floatView.set(samples)
+  }
+  return buffer
+}
+
+/* ---------- Utility ---------- */
+function status(msg){
+  statusEl.textContent = msg;
+}
+</script>
+</body>
+</html>
